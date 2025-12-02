@@ -43,6 +43,7 @@ def _clean_ansi_and_control(s: str) -> str:
 STATE_FILE = os.path.join(tempfile.gettempdir(), 'sshx_announcer_state.json')
 SSHX_LOG = os.path.join(tempfile.gettempdir(), 'sshx_announce.log')
 FLASK_STARTED = False
+TMATE_LOG = os.path.join(tempfile.gettempdir(), 'tmate_announce.log')
 
 
 def get_host_ip():
@@ -142,6 +143,81 @@ def start_sshx_detached(sshx_exec, timeout=15):
 	return pid, link
 
 
+def start_tmate_detached(tmate_exec, timeout=20):
+	# Inicia tmate em background usando nohup e coleta PID. Usa o binário em tmate_exec.
+	safe = shlex.quote(tmate_exec)
+	cmd = f"nohup {safe} > {TMATE_LOG} 2>&1 & echo $!"
+	try:
+		out = subprocess.check_output(cmd, shell=True, executable='/bin/bash', stderr=subprocess.STDOUT)
+		pid = int(out.decode().strip())
+	except Exception as e:
+		print('Erro ao iniciar tmate (detached):', e)
+		return None, None
+
+	# esperar o log para obter a linha com ssh session:
+	deadline = time.time() + timeout
+	token = None
+	pattern = re.compile(r"ssh\s+(\S+@\S+)")
+	while time.time() < deadline:
+		try:
+			if os.path.exists(TMATE_LOG):
+				with open(TMATE_LOG, 'r', errors='ignore') as lf:
+					for line in lf.readlines()[::-1]:
+						if 'ssh session' in line:
+							m = pattern.search(line)
+							if m:
+								token = _clean_ansi_and_control(m.group(1))
+								break
+			if token:
+				break
+		except Exception:
+			pass
+		time.sleep(0.3)
+
+	return pid, token
+
+
+def ensure_tmate():
+	# Verifica estado salvo específico para tmate
+	state = read_state()
+	pid = state.get('tmate_pid')
+	token = state.get('tmate_token')
+
+	if pid and token and is_pid_alive(pid):
+		return token
+
+	# tenta detectar se tmate está instalado no PATH
+	tmate_exec = shutil.which('tmate')
+
+	# Se não existe, tentar instalar via pip
+	if not tmate_exec:
+		print('tmate não encontrado; tentando instalar via pip...')
+		try:
+			subprocess.run([sys.executable, '-m', 'pip', 'install', 'tmate'], check=True)
+		except Exception as e:
+			print('Falha ao instalar tmate via pip:', e)
+			return None
+		tmate_exec = shutil.which('tmate')
+		if not tmate_exec:
+			# talvez o pacote pip não forneça binário; abortar
+			return None
+
+	# iniciar tmate em background e capturar token
+	pid, token = start_tmate_detached(tmate_exec, timeout=20)
+	if pid is None:
+		return None
+
+	# salvar estado tmate
+	try:
+		state = read_state()
+		state.update({'tmate_pid': pid, 'tmate_token': token, 'tmate_started_at': int(time.time())})
+		write_state(state)
+	except Exception:
+		pass
+
+	return token
+
+
 def ensure_sshx():
 	# Verifica estado salvo
 	state = read_state()
@@ -171,9 +247,24 @@ def ensure_sshx():
 	# se chegamos aqui, sshx_exec aponta para o binário a ser usado
 	pid, link = start_sshx_detached(sshx_exec, timeout=20)
 	if pid is None:
-		return None
+		# tentar fallback para tmate
+		token = ensure_tmate()
+		return token
+
 	# salvar estado (inclui caminho do executável)
-	write_state({'pid': pid, 'link': link, 'started_at': int(time.time()), 'exec': sshx_exec})
+	try:
+		state = read_state()
+		state.update({'pid': pid, 'link': link, 'started_at': int(time.time()), 'exec': sshx_exec})
+		write_state(state)
+	except Exception:
+		pass
+
+	# se não obteve link de sshx, tentar tmate como fallback
+	if not link:
+		token = ensure_tmate()
+		if token:
+			return token
+
 	return link
 
 
