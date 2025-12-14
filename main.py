@@ -230,21 +230,58 @@ def start_cloudflared_detached(cf_exec, timeout=30):
 		print('Erro ao iniciar cloudflared (detached):', e)
 		return None, None
 
-	# esperar o log para obter a linha com trycloudflare URL
-	deadline = time.time() + timeout
+	# Após iniciar, detectar PID real do processo (o nohup/encapsulador pode
+	# devolver o PID do shell; então buscamos o processo 'cloudflared' ativo
+	# que contenha o argumento '--url localhost:8081' e preferimos esse PID.
+	def _find_running_cf(pid_hint=None):
+		try:
+			out = subprocess.check_output(['ps', '-eo', 'pid,args'], text=True)
+		except Exception:
+			return None
+		best = None
+		for line in out.splitlines():
+			parts = line.strip().split(None, 1)
+			if len(parts) < 2:
+				continue
+			try:
+				p = int(parts[0])
+			except Exception:
+				continue
+			args = parts[1]
+			if 'cloudflared' in args and '--url localhost:8081' in args:
+				# prefer the hinted pid if match
+				if pid_hint and p == pid_hint:
+					return p
+				best = p
+		return best
+
+	real_pid = _find_running_cf(pid_hint=pid)
+	if real_pid:
+		pid = real_pid
+
+	# esperar o log para obter a linha com trycloudflare URL (espera maior)
+	deadline = time.time() + max(timeout, 60)
 	domain = None
 	pattern = re.compile(r'https?://[^\s]+trycloudflare\.com[^\s]*')
+	last_size = 0
 	while time.time() < deadline:
 		try:
 			if os.path.exists(CLOUDFLARED_LOG):
+				# ler apenas o novo conteúdo para eficiência
 				with open(CLOUDFLARED_LOG, 'r', errors='ignore') as lf:
-					for line in lf.readlines()[::-1]:
-						m = pattern.search(line)
-						if m:
-							domain = _clean_ansi_and_control(m.group(0))
-							break
-			if domain:
-				break
+					lf.seek(0, os.SEEK_END)
+					size = lf.tell()
+					# se arquivo encolheu, re-ler tudo
+					if size < last_size:
+						lf.seek(0)
+					else:
+						lf.seek(max(0, size - 16384))
+					data = lf.read()
+					last_size = size
+					m = pattern.search(data)
+					if m:
+						domain = _clean_ansi_and_control(m.group(0))
+						break
 		except Exception:
 			pass
 		time.sleep(0.5)
@@ -284,8 +321,25 @@ def ensure_cloudflared():
 	pid = state.get('cloudflared_pid')
 	domain = state.get('cloudflared_url')
 
+	# Se o PID salvo estiver vivo e já tivermos domínio, retornar
 	if pid and domain and is_pid_alive(pid):
 		return domain
+
+	# Se PID salvo está vivo mas domínio ausente, tentar extrair do log
+	if pid and is_pid_alive(pid) and not domain:
+		try:
+			if os.path.exists(CLOUDFLARED_LOG):
+				with open(CLOUDFLARED_LOG, 'r', errors='ignore') as lf:
+					data = lf.read()
+					m = re.search(r'https?://[^\s]+trycloudflare\.com[^\s]*', data)
+					if m:
+						domain = _clean_ansi_and_control(m.group(0))
+						state.update({'cloudflared_url': domain})
+						write_state(state)
+						return domain
+		except Exception:
+			pass
+
 
 	# detecta binário
 	cf_exec = shutil.which('cloudflared')
@@ -294,12 +348,30 @@ def ensure_cloudflared():
 		if os.path.isfile(local_exec) and os.access(local_exec, os.X_OK):
 			cf_exec = local_exec
 
+	# se não encontrado, tenta baixar para ./cloudflared
 	if not cf_exec:
 		local_exec = os.path.join(os.getcwd(), 'cloudflared')
 		ok = download_cloudflared(local_exec)
 		if not ok:
-			return None
-		cf_exec = local_exec
+			# antes de falhar, tentar detectar se já existe um processo cloudflared
+			try:
+				out = subprocess.check_output(['ps', '-eo', 'pid,args'], text=True)
+				for line in out.splitlines():
+					if 'cloudflared' in line and '--url localhost:8081' in line:
+						parts = line.strip().split(None, 1)
+						try:
+							maybe_pid = int(parts[0])
+							if is_pid_alive(maybe_pid):
+								# tentar extrair domínio do log
+								pid = maybe_pid
+								break
+						except Exception:
+							continue
+			except Exception:
+				pass
+			if not cf_exec and not pid:
+				return None
+		cf_exec = local_exec if os.path.isfile(local_exec) and os.access(local_exec, os.X_OK) else cf_exec
 
 	pid, domain = start_cloudflared_detached(cf_exec, timeout=30)
 	if pid is None:
@@ -389,12 +461,30 @@ def start_flask_server():
 		except Exception as e:
 			print('Ainda não foi possível importar Flask após instalação:', e)
 			return False
-
 	app = Flask('announcer_api')
 
 	@app.route('/ping', methods=['GET'])
 	def ping():
 		return jsonify({'hello': 'hello'})
+
+	# registrar rotas adicionais fornecidas pelos módulos em ./libs (se existirem)
+	try:
+		from libs import myrientAPI
+		try:
+			myrientAPI.register_routes(app)
+		except Exception as e:
+			print('Aviso: falha ao registrar rotas do myrientAPI:', e)
+	except Exception:
+		pass
+
+	try:
+		from libs import dlmanagerAPI
+		try:
+			dlmanagerAPI.register_routes(app)
+		except Exception as e:
+			print('Aviso: falha ao registrar rotas do dlmanagerAPI:', e)
+	except Exception:
+		pass
 
 	def run_app():
 		# roda o flask no thread separado
